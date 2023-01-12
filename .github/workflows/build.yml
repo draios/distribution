@@ -14,7 +14,7 @@ on:
   pull_request:
 
 env:
-  DOCKERHUB_SLUG: distribution/distribution
+  DOCKERHUB_SLUG: jackbit/distribution
 
 jobs:
   test:
