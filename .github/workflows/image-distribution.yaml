@@ -21,7 +21,7 @@ on:
 
 jobs:
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
     - uses: draios/infra-action-buildnpush@v1
