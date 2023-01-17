@@ -1,0 +1,39 @@
+name: build and push
+
+on:
+  # allows to manually run the workflow from the UI
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'DryRun'
+        required: true
+        default: 'false'
+
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+  push:
+    branches:
+      - 'main'
+      - 'release/*'
+    tags:
+      - '*'
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+    - uses: actions/checkout@v2
+    - uses: draios/infra-action-buildnpush@v1
+      with:
+        push_to_quay: true
+        image_name: "distribution"
+        image_description: "sysdig image for distribution"
+        context_path: "containers/distribution"
+        dockerfile: "Dockerfile"
+        dry_run: ${{ ! ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')) }}
+        artifactory_username: ${{ secrets.ARTIFACTORY_USERNAME }}
+        artifactory_password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+        quay_username: ${{ secrets.QUAY_USERNAME }}
+        quay_password: ${{ secrets.QUAY_PASSWORD }}
+        github_token: ${{ secrets.GITHUB_TOKEN }}
