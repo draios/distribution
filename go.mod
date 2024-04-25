@@ -1,6 +1,6 @@
 module github.com/distribution/distribution/v3
 
-go 1.18
+go 1.21
 
 require (
 	github.com/Azure/azure-sdk-for-go v56.3.0+incompatible
