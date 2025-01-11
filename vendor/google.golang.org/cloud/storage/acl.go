@@ -1,4 +1,4 @@
-// Copyright 2014 Google Inc. All Rights Reserved.
+// Copyright 2014 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,24 +15,29 @@
 package storage
 
 import (
-	"fmt"
+	"context"
+	"net/http"
+	"reflect"
 
-	"golang.org/x/net/context"
+	"cloud.google.com/go/internal/trace"
+	"google.golang.org/api/googleapi"
 	raw "google.golang.org/api/storage/v1"
 )
 
-// ACLRole is the the access permission for the entity.
+// ACLRole is the level of access to grant.
 type ACLRole string
 
 const (
 	RoleOwner  ACLRole = "OWNER"
 	RoleReader ACLRole = "READER"
+	RoleWriter ACLRole = "WRITER"
 )
 
-// ACLEntity is an entity holding an ACL permission.
+// ACLEntity refers to a user or group.
+// They are sometimes referred to as grantees.
 //
 // It could be in the form of:
-// "user-<userId>", "user-<email>","group-<groupId>", "group-<email>",
+// "user-<userId>", "user-<email>", "group-<groupId>", "group-<email>",
 // "domain-<domain>" and "project-team-<projectId>".
 //
 // Or one of the predefined constants: AllUsers, AllAuthenticatedUsers.
@@ -43,134 +48,288 @@ const (
 	AllAuthenticatedUsers ACLEntity = "allAuthenticatedUsers"
 )
 
-// ACLRule represents an access control list rule entry for a Google Cloud Storage object or bucket.
-// A bucket is a Google Cloud Storage container whose name is globally unique and contains zero or
-// more objects.  An object is a blob of data that is stored in a bucket.
+// ACLRule represents a grant for a role to an entity (user, group or team) for a
+// Google Cloud Storage object or bucket.
 type ACLRule struct {
-	// Entity identifies the entity holding the current rule's permissions.
-	Entity ACLEntity
-
-	// Role is the the access permission for the entity.
-	Role ACLRole
+	Entity      ACLEntity
+	EntityID    string
+	Role        ACLRole
+	Domain      string
+	Email       string
+	ProjectTeam *ProjectTeam
 }
 
-// DefaultACL returns the default object ACL entries for the named bucket.
-func DefaultACL(ctx context.Context, bucket string) ([]ACLRule, error) {
-	acls, err := rawService(ctx).DefaultObjectAccessControls.List(bucket).Context(ctx).Do()
+// ProjectTeam is the project team associated with the entity, if any.
+type ProjectTeam struct {
+	ProjectNumber string
+	Team          string
+}
+
+// ACLHandle provides operations on an access control list for a Google Cloud Storage bucket or object.
+type ACLHandle struct {
+	c           *Client
+	bucket      string
+	object      string
+	isDefault   bool
+	userProject string // for requester-pays buckets
+}
+
+// Delete permanently deletes the ACL entry for the given entity.
+func (a *ACLHandle) Delete(ctx context.Context, entity ACLEntity) (err error) {
+	ctx = trace.StartSpan(ctx, "cloud.google.com/go/storage.ACL.Delete")
+	defer func() { trace.EndSpan(ctx, err) }()
+
+	if a.object != "" {
+		return a.objectDelete(ctx, entity)
+	}
+	if a.isDefault {
+		return a.bucketDefaultDelete(ctx, entity)
+	}
+	return a.bucketDelete(ctx, entity)
+}
+
+// Set sets the role for the given entity.
+func (a *ACLHandle) Set(ctx context.Context, entity ACLEntity, role ACLRole) (err error) {
+	ctx = trace.StartSpan(ctx, "cloud.google.com/go/storage.ACL.Set")
+	defer func() { trace.EndSpan(ctx, err) }()
+
+	if a.object != "" {
+		return a.objectSet(ctx, entity, role, false)
+	}
+	if a.isDefault {
+		return a.objectSet(ctx, entity, role, true)
+	}
+	return a.bucketSet(ctx, entity, role)
+}
+
+// List retrieves ACL entries.
+func (a *ACLHandle) List(ctx context.Context) (rules []ACLRule, err error) {
+	ctx = trace.StartSpan(ctx, "cloud.google.com/go/storage.ACL.List")
+	defer func() { trace.EndSpan(ctx, err) }()
+
+	if a.object != "" {
+		return a.objectList(ctx)
+	}
+	if a.isDefault {
+		return a.bucketDefaultList(ctx)
+	}
+	return a.bucketList(ctx)
+}
+
+func (a *ACLHandle) bucketDefaultList(ctx context.Context) ([]ACLRule, error) {
+	var acls *raw.ObjectAccessControls
+	var err error
+	err = runWithRetry(ctx, func() error {
+		req := a.c.raw.DefaultObjectAccessControls.List(a.bucket)
+		a.configureCall(ctx, req)
+		acls, err = req.Do()
+		return err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("storage: error listing default object ACL for bucket %q: %v", bucket, err)
+		return nil, err
 	}
-	r := make([]ACLRule, 0, len(acls.Items))
-	for _, v := range acls.Items {
-		if m, ok := v.(map[string]interface{}); ok {
-			entity, ok1 := m["entity"].(string)
-			role, ok2 := m["role"].(string)
-			if ok1 && ok2 {
-				r = append(r, ACLRule{Entity: ACLEntity(entity), Role: ACLRole(role)})
-			}
-		}
-	}
-	return r, nil
+	return toObjectACLRules(acls.Items), nil
 }
 
-// PutDefaultACLRule saves the named default object ACL entity with the provided role for the named bucket.
-func PutDefaultACLRule(ctx context.Context, bucket string, entity ACLEntity, role ACLRole) error {
-	acl := &raw.ObjectAccessControl{
-		Bucket: bucket,
-		Entity: string(entity),
-		Role:   string(role),
-	}
-	_, err := rawService(ctx).DefaultObjectAccessControls.Update(bucket, string(entity), acl).Context(ctx).Do()
+func (a *ACLHandle) bucketDefaultDelete(ctx context.Context, entity ACLEntity) error {
+	return runWithRetry(ctx, func() error {
+		req := a.c.raw.DefaultObjectAccessControls.Delete(a.bucket, string(entity))
+		a.configureCall(ctx, req)
+		return req.Do()
+	})
+}
+
+func (a *ACLHandle) bucketList(ctx context.Context) ([]ACLRule, error) {
+	var acls *raw.BucketAccessControls
+	var err error
+	err = runWithRetry(ctx, func() error {
+		req := a.c.raw.BucketAccessControls.List(a.bucket)
+		a.configureCall(ctx, req)
+		acls, err = req.Do()
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("storage: error updating default ACL rule for bucket %q, entity %q: %v", bucket, entity, err)
+		return nil, err
 	}
-	return nil
+	return toBucketACLRules(acls.Items), nil
 }
 
-// DeleteDefaultACLRule deletes the named default ACL entity for the named bucket.
-func DeleteDefaultACLRule(ctx context.Context, bucket string, entity ACLEntity) error {
-	err := rawService(ctx).DefaultObjectAccessControls.Delete(bucket, string(entity)).Context(ctx).Do()
-	if err != nil {
-		return fmt.Errorf("storage: error deleting default ACL rule for bucket %q, entity %q: %v", bucket, entity, err)
-	}
-	return nil
-}
-
-// BucketACL returns the ACL entries for the named bucket.
-func BucketACL(ctx context.Context, bucket string) ([]ACLRule, error) {
-	acls, err := rawService(ctx).BucketAccessControls.List(bucket).Context(ctx).Do()
-	if err != nil {
-		return nil, fmt.Errorf("storage: error listing bucket ACL for bucket %q: %v", bucket, err)
-	}
-	r := make([]ACLRule, len(acls.Items))
-	for i, v := range acls.Items {
-		r[i].Entity = ACLEntity(v.Entity)
-		r[i].Role = ACLRole(v.Role)
-	}
-	return r, nil
-}
-
-// PutBucketACLRule saves the named ACL entity with the provided role for the named bucket.
-func PutBucketACLRule(ctx context.Context, bucket string, entity ACLEntity, role ACLRole) error {
+func (a *ACLHandle) bucketSet(ctx context.Context, entity ACLEntity, role ACLRole) error {
 	acl := &raw.BucketAccessControl{
-		Bucket: bucket,
+		Bucket: a.bucket,
 		Entity: string(entity),
 		Role:   string(role),
 	}
-	_, err := rawService(ctx).BucketAccessControls.Update(bucket, string(entity), acl).Context(ctx).Do()
+	err := runWithRetry(ctx, func() error {
+		req := a.c.raw.BucketAccessControls.Update(a.bucket, string(entity), acl)
+		a.configureCall(ctx, req)
+		_, err := req.Do()
+		return err
+	})
 	if err != nil {
-		return fmt.Errorf("storage: error updating bucket ACL rule for bucket %q, entity %q: %v", bucket, entity, err)
+		return err
 	}
 	return nil
 }
 
-// DeleteBucketACLRule deletes the named ACL entity for the named bucket.
-func DeleteBucketACLRule(ctx context.Context, bucket string, entity ACLEntity) error {
-	err := rawService(ctx).BucketAccessControls.Delete(bucket, string(entity)).Context(ctx).Do()
-	if err != nil {
-		return fmt.Errorf("storage: error deleting bucket ACL rule for bucket %q, entity %q: %v", bucket, entity, err)
-	}
-	return nil
+func (a *ACLHandle) bucketDelete(ctx context.Context, entity ACLEntity) error {
+	return runWithRetry(ctx, func() error {
+		req := a.c.raw.BucketAccessControls.Delete(a.bucket, string(entity))
+		a.configureCall(ctx, req)
+		return req.Do()
+	})
 }
 
-// ACL returns the ACL entries for the named object.
-func ACL(ctx context.Context, bucket, object string) ([]ACLRule, error) {
-	acls, err := rawService(ctx).ObjectAccessControls.List(bucket, object).Context(ctx).Do()
+func (a *ACLHandle) objectList(ctx context.Context) ([]ACLRule, error) {
+	var acls *raw.ObjectAccessControls
+	var err error
+	err = runWithRetry(ctx, func() error {
+		req := a.c.raw.ObjectAccessControls.List(a.bucket, a.object)
+		a.configureCall(ctx, req)
+		acls, err = req.Do()
+		return err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("storage: error listing object ACL for bucket %q, file %q: %v", bucket, object, err)
+		return nil, err
 	}
-	r := make([]ACLRule, 0, len(acls.Items))
-	for _, v := range acls.Items {
-		if m, ok := v.(map[string]interface{}); ok {
-			entity, ok1 := m["entity"].(string)
-			role, ok2 := m["role"].(string)
-			if ok1 && ok2 {
-				r = append(r, ACLRule{Entity: ACLEntity(entity), Role: ACLRole(role)})
-			}
-		}
-	}
-	return r, nil
+	return toObjectACLRules(acls.Items), nil
 }
 
-// PutACLRule saves the named ACL entity with the provided role for the named object.
-func PutACLRule(ctx context.Context, bucket, object string, entity ACLEntity, role ACLRole) error {
+func (a *ACLHandle) objectSet(ctx context.Context, entity ACLEntity, role ACLRole, isBucketDefault bool) error {
+	type setRequest interface {
+		Do(opts ...googleapi.CallOption) (*raw.ObjectAccessControl, error)
+		Header() http.Header
+	}
+
 	acl := &raw.ObjectAccessControl{
-		Bucket: bucket,
+		Bucket: a.bucket,
 		Entity: string(entity),
 		Role:   string(role),
 	}
-	_, err := rawService(ctx).ObjectAccessControls.Update(bucket, object, string(entity), acl).Context(ctx).Do()
-	if err != nil {
-		return fmt.Errorf("storage: error updating object ACL rule for bucket %q, file %q, entity %q: %v", bucket, object, entity, err)
+	var req setRequest
+	if isBucketDefault {
+		req = a.c.raw.DefaultObjectAccessControls.Update(a.bucket, string(entity), acl)
+	} else {
+		req = a.c.raw.ObjectAccessControls.Update(a.bucket, a.object, string(entity), acl)
 	}
-	return nil
+	a.configureCall(ctx, req)
+	return runWithRetry(ctx, func() error {
+		_, err := req.Do()
+		return err
+	})
 }
 
-// DeleteACLRule deletes the named ACL entity for the named object.
-func DeleteACLRule(ctx context.Context, bucket, object string, entity ACLEntity) error {
-	err := rawService(ctx).ObjectAccessControls.Delete(bucket, object, string(entity)).Context(ctx).Do()
-	if err != nil {
-		return fmt.Errorf("storage: error deleting object ACL rule for bucket %q, file %q, entity %q: %v", bucket, object, entity, err)
+func (a *ACLHandle) objectDelete(ctx context.Context, entity ACLEntity) error {
+	return runWithRetry(ctx, func() error {
+		req := a.c.raw.ObjectAccessControls.Delete(a.bucket, a.object, string(entity))
+		a.configureCall(ctx, req)
+		return req.Do()
+	})
+}
+
+func (a *ACLHandle) configureCall(ctx context.Context, call interface{ Header() http.Header }) {
+	vc := reflect.ValueOf(call)
+	vc.MethodByName("Context").Call([]reflect.Value{reflect.ValueOf(ctx)})
+	if a.userProject != "" {
+		vc.MethodByName("UserProject").Call([]reflect.Value{reflect.ValueOf(a.userProject)})
 	}
-	return nil
+	setClientHeader(call.Header())
+}
+
+func toObjectACLRules(items []*raw.ObjectAccessControl) []ACLRule {
+	var rs []ACLRule
+	for _, item := range items {
+		rs = append(rs, toObjectACLRule(item))
+	}
+	return rs
+}
+
+func toBucketACLRules(items []*raw.BucketAccessControl) []ACLRule {
+	var rs []ACLRule
+	for _, item := range items {
+		rs = append(rs, toBucketACLRule(item))
+	}
+	return rs
+}
+
+func toObjectACLRule(a *raw.ObjectAccessControl) ACLRule {
+	return ACLRule{
+		Entity:      ACLEntity(a.Entity),
+		EntityID:    a.EntityId,
+		Role:        ACLRole(a.Role),
+		Domain:      a.Domain,
+		Email:       a.Email,
+		ProjectTeam: toObjectProjectTeam(a.ProjectTeam),
+	}
+}
+
+func toBucketACLRule(a *raw.BucketAccessControl) ACLRule {
+	return ACLRule{
+		Entity:      ACLEntity(a.Entity),
+		EntityID:    a.EntityId,
+		Role:        ACLRole(a.Role),
+		Domain:      a.Domain,
+		Email:       a.Email,
+		ProjectTeam: toBucketProjectTeam(a.ProjectTeam),
+	}
+}
+
+func toRawObjectACL(rules []ACLRule) []*raw.ObjectAccessControl {
+	if len(rules) == 0 {
+		return nil
+	}
+	r := make([]*raw.ObjectAccessControl, 0, len(rules))
+	for _, rule := range rules {
+		r = append(r, rule.toRawObjectAccessControl("")) // bucket name unnecessary
+	}
+	return r
+}
+
+func toRawBucketACL(rules []ACLRule) []*raw.BucketAccessControl {
+	if len(rules) == 0 {
+		return nil
+	}
+	r := make([]*raw.BucketAccessControl, 0, len(rules))
+	for _, rule := range rules {
+		r = append(r, rule.toRawBucketAccessControl("")) // bucket name unnecessary
+	}
+	return r
+}
+
+func (r ACLRule) toRawBucketAccessControl(bucket string) *raw.BucketAccessControl {
+	return &raw.BucketAccessControl{
+		Bucket: bucket,
+		Entity: string(r.Entity),
+		Role:   string(r.Role),
+		// The other fields are not settable.
+	}
+}
+
+func (r ACLRule) toRawObjectAccessControl(bucket string) *raw.ObjectAccessControl {
+	return &raw.ObjectAccessControl{
+		Bucket: bucket,
+		Entity: string(r.Entity),
+		Role:   string(r.Role),
+		// The other fields are not settable.
+	}
+}
+
+func toBucketProjectTeam(p *raw.BucketAccessControlProjectTeam) *ProjectTeam {
+	if p == nil {
+		return nil
+	}
+	return &ProjectTeam{
+		ProjectNumber: p.ProjectNumber,
+		Team:          p.Team,
+	}
+}
+
+func toObjectProjectTeam(p *raw.ObjectAccessControlProjectTeam) *ProjectTeam {
+	if p == nil {
+		return nil
+	}
+	return &ProjectTeam{
+		ProjectNumber: p.ProjectNumber,
+		Team:          p.Team,
+	}
 }
