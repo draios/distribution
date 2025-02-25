@@ -23,7 +23,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - uses: draios/infra-action-buildnpush@v1
       with:
         push_to_quay: true
@@ -32,8 +32,8 @@ jobs:
         context_path: "."
         dockerfile: "Dockerfile"
         dry_run: ${{ ! ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')) }}
-        artifactory_username: ${{ secrets.ARTIFACTORY_USERNAME }}
-        artifactory_password: ${{ secrets.ARTIFACTORY_PASSWORD }}
+        gar_prefix: "us-docker.pkg.dev/sysdig-artifact-registry-dev/gar-docker/infra"
+        gar_password: ${{ secrets.GAR_PASSWORD }}
         quay_username: ${{ secrets.QUAY_USERNAME }}
         quay_password: ${{ secrets.QUAY_PASSWORD }}
         github_token: ${{ secrets.GITHUB_TOKEN }}
