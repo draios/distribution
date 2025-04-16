@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - uses: draios/infra-action-buildnpush@v1
+    - uses: draios/infra-action-buildnpush@v1.2.3
       with:
         push_to_quay: true
         image_name: "distribution"
