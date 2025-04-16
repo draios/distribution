@@ -33,6 +33,7 @@ jobs:
         dockerfile: "Dockerfile"
         dry_run: ${{ ! ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')) }}
         gar_prefix: "us-docker.pkg.dev/sysdig-artifact-registry-dev/gar-docker/infra"
+        quay_prefix: quay.io/sysdig
         gar_password: ${{ secrets.GAR_DEV_RW_JSON_KEY }}
         quay_username: ${{ secrets.QUAY_USERNAME }}
         quay_password: ${{ secrets.QUAY_PASSWORD }}
